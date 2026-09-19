@@ -18,6 +18,8 @@ from homeassistant.core import callback
 from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
+    DeviceSelector,
+    DeviceSelectorConfig,
     SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
@@ -39,6 +41,7 @@ from .const import (
     CONF_API_KEY,
     CONF_CONTINUED_CONVERSATION_MODE,
     CONF_CONTEXT_MAX_CHARS,
+    CONF_DISABLE_CONTINUED_CONVERSATION_DEVICE_IDS,
     CONF_ENABLE_SESSION_REUSE,
     CONF_EXPOSE_DEVICE_CONTEXT,
     CONF_FALLBACK_MEDIA_PLAYER,
@@ -54,6 +57,7 @@ from .const import (
     CONF_VERIFY_SSL,
     DEFAULT_ALWAYS_SPEAK_FALLBACK,
     DEFAULT_CONTEXT_MAX_CHARS,
+    DEFAULT_DISABLE_CONTINUED_CONVERSATION_DEVICE_IDS,
     DEFAULT_ENABLE_SESSION_REUSE,
     DEFAULT_EXPOSE_DEVICE_CONTEXT,
     DEFAULT_FALLBACK_MEDIA_PLAYER,
@@ -556,6 +560,17 @@ class HermesConversationOptionsFlow(OptionsFlow):
                     ): SelectSelector(
                         SelectSelectorConfig(options=_FOLLOW_UP_MODE_OPTIONS)
                     ),
+                    vol.Optional(
+                        CONF_DISABLE_CONTINUED_CONVERSATION_DEVICE_IDS,
+                        default=list(
+                            entry_value(
+                                self.config_entry,
+                                CONF_DISABLE_CONTINUED_CONVERSATION_DEVICE_IDS,
+                                DEFAULT_DISABLE_CONTINUED_CONVERSATION_DEVICE_IDS,
+                            )
+                            or ()
+                        ),
+                    ): DeviceSelector(DeviceSelectorConfig(multiple=True)),
                     vol.Optional(
                         CONF_ENABLE_SESSION_REUSE,
                         default=entry_value(

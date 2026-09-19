@@ -57,6 +57,7 @@
           "include_exposed_entities": "Include exposed entities in prompt",
           "context_max_chars": "Max context characters",
           "continued_conversation_mode": "Follow-up listening",
+          "disable_continued_conversation_device_ids": "Disable follow-up listening for devices",
           "enable_session_reuse": "Reuse Hermes server sessions across short voice turns",
           "session_timeout_seconds": "Voice session reuse timeout (seconds)",
           "expose_device_context": "Include device/satellite context in prompt",

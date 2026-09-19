@@ -13,6 +13,7 @@ from custom_components.hermes_conversation.const import (
     CONF_API_KEY,
     CONF_CONTEXT_MAX_CHARS,
     CONF_CONTINUED_CONVERSATION_MODE,
+    CONF_DISABLE_CONTINUED_CONVERSATION_DEVICE_IDS,
     CONF_ENABLE_CONTINUED_CONVERSATION,
     CONF_ENABLE_SESSION_REUSE,
     CONF_INCLUDE_EXPOSED_ENTITIES,
@@ -260,6 +261,27 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
                 msg["content"] for msg in messages if msg["role"] == "system"
             ),
         )
+
+    async def test_disabled_device_never_continues_in_always_mode(self):
+        entry = FakeConfigEntry(
+            options={
+                CONF_CONTINUED_CONVERSATION_MODE: FOLLOW_UP_MODE_ALWAYS,
+                CONF_DISABLE_CONTINUED_CONVERSATION_DEVICE_IDS: ["watch-device"],
+                CONF_ENABLE_SESSION_REUSE: False,
+                CONF_PROMPT: "",
+            }
+        )
+        client = FakeClient()
+        client.next_text = "Would you like anything else?"
+        agent = HermesConversationAgent(FakeHass(), entry, client, session_map={})
+
+        result = await agent.async_process(
+            FakeConversationInput(
+                "hello", conversation_id="conv-watch", device_id="watch-device"
+            )
+        )
+
+        self.assertFalse(result.continue_conversation)
 
     async def test_follow_up_mode_auto_keeps_listening_for_questions_only(self):
         entry = FakeConfigEntry(

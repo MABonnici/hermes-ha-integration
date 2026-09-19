@@ -356,6 +356,8 @@ def install_stubs():
 
     selector = types.ModuleType("homeassistant.helpers.selector")
     selector.SelectOptionDict = dict
+    selector.DeviceSelector = lambda config=None: {"device_selector": config}
+    selector.DeviceSelectorConfig = lambda **kwargs: kwargs
     selector.SelectSelector = lambda config=None: {"select_selector": config}
     selector.SelectSelectorConfig = lambda **kwargs: kwargs
     selector.TextSelector = lambda config=None: {"selector": config}

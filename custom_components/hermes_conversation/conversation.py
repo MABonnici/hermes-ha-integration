@@ -34,6 +34,7 @@ from .const import (
     CONF_ALWAYS_SPEAK_FALLBACK,
     CONF_API_KEY,
     CONF_CONTEXT_MAX_CHARS,
+    CONF_DISABLE_CONTINUED_CONVERSATION_DEVICE_IDS,
     CONF_ENABLE_SESSION_REUSE,
     CONF_EXPOSE_DEVICE_CONTEXT,
     CONF_FALLBACK_MEDIA_PLAYER,
@@ -43,6 +44,7 @@ from .const import (
     CONF_SESSION_TIMEOUT_SECONDS,
     DEFAULT_ALWAYS_SPEAK_FALLBACK,
     DEFAULT_CONTEXT_MAX_CHARS,
+    DEFAULT_DISABLE_CONTINUED_CONVERSATION_DEVICE_IDS,
     DEFAULT_ENABLE_SESSION_REUSE,
     DEFAULT_EXPOSE_DEVICE_CONTEXT,
     DEFAULT_FALLBACK_MEDIA_PLAYER,
@@ -453,6 +455,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         continue_conversation = self._should_continue_conversation(
             follow_up_mode,
             spoken_text,
+            user_input,
         )
 
         return self._build_conversation_result(
@@ -707,8 +710,19 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         self,
         follow_up_mode: str,
         response_text: str,
+        user_input: ConversationInput,
     ) -> bool:
         """Return whether the voice pipeline should keep listening."""
+        disabled_device_ids = set(
+            entry_value(
+                self.entry,
+                CONF_DISABLE_CONTINUED_CONVERSATION_DEVICE_IDS,
+                DEFAULT_DISABLE_CONTINUED_CONVERSATION_DEVICE_IDS,
+            )
+            or ()
+        )
+        if getattr(user_input, "device_id", None) in disabled_device_ids:
+            return False
         if follow_up_mode == FOLLOW_UP_MODE_ALWAYS:
             return True
         if follow_up_mode != FOLLOW_UP_MODE_AUTO:
