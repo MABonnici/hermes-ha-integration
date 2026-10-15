@@ -14,10 +14,21 @@ from .compat import normalize_host, normalize_profile, normalize_profile_route
 from .const import (
     API_CHAT_COMPLETIONS,
     API_HEALTH,
+    API_HEALTH_DETAILED,
     API_MODELS,
     DEFAULT_MODEL,
     DEFAULT_STREAM_TIMEOUT,
     DEFAULT_TIMEOUT,
+    ERROR_CATEGORY_AUTH,
+    ERROR_CATEGORY_MALFORMED,
+    ERROR_CATEGORY_REDIRECT,
+    ERROR_CATEGORY_SERVER,
+    ERROR_CATEGORY_TIMEOUT,
+    ERROR_CATEGORY_UNREACHABLE,
+    ERROR_CATEGORY_UNSUPPORTED,
+    HEALTH_STATUSES,
+    REDIRECT_STATUS_CODES,
+    UNSUPPORTED_DETAILED_STATUS_CODES,
     ProfileRouteFamily,
 )
 
@@ -32,13 +43,28 @@ class HermesApiError(Exception):
 class HermesConnectionError(HermesApiError):
     """Cannot reach the Hermes Agent API."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_category: str = ERROR_CATEGORY_UNREACHABLE,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_category = error_category
+
 
 class HermesAuthError(HermesApiError):
     """Authentication failed."""
 
 
 class HermesStreamSetupError(HermesApiError):
-    """Streaming request was rejected before a stream was established."""
+    """Explicitly known pre-dispatch streaming rejection from an adapter.
+
+    An HTTP failure from a submitted chat POST is never proof of pre-dispatch
+    rejection: the server may already have executed model or tool work.
+    """
 
 
 @dataclass(slots=True)
@@ -47,6 +73,16 @@ class HermesApiResult:
 
     text: str
     session_id: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class HermesDetailedHealthResult:
+    """Whitelisted optional /health/detailed outcome; never stores raw payload."""
+
+    available: bool
+    status: str | None
+    error_category: str | None
+    auth_failed: bool = False
 
 
 class HermesApiClient:
@@ -111,6 +147,19 @@ class HermesApiClient:
             headers["X-Hermes-Session-Id"] = session_id
         return headers
 
+    def _classify_status_error(self, status: int) -> HermesConnectionError:
+        if status in REDIRECT_STATUS_CODES:
+            category = ERROR_CATEGORY_REDIRECT
+        elif status >= 500:
+            category = ERROR_CATEGORY_SERVER
+        else:
+            category = ERROR_CATEGORY_UNREACHABLE
+        return HermesConnectionError(
+            "Hermes API request failed",
+            status_code=status,
+            error_category=category,
+        )
+
     async def _async_verify_native_profile_route(self) -> bool:
         """Verify that a named native route selects and identifies its profile."""
         if not (
@@ -132,10 +181,7 @@ class HermesApiClient:
                 allow_redirects=False,
             ) as resp:
                 if resp.status != 404:
-                    raise HermesConnectionError(
-                        "Native profile routing is not fail-closed. Enable "
-                        "Hermes profile multiplexing or update Hermes Agent."
-                    )
+                    raise self._classify_status_error(resp.status)
 
             async with self._session.get(
                 f"{self._base_url}{API_HEALTH}",
@@ -145,25 +191,23 @@ class HermesApiClient:
                 allow_redirects=False,
             ) as resp:
                 if resp.status != 200:
-                    raise HermesConnectionError(
-                        "Native profile route did not expose the required Hermes "
-                        f"health endpoint (HTTP {resp.status})"
-                    )
+                    raise self._classify_status_error(resp.status)
                 health = await resp.json()
                 if not isinstance(health, dict) or (
                     health.get("status") != "ok"
                     or health.get("platform") != "hermes-agent"
                 ):
                     raise HermesConnectionError(
-                        "Native profile route did not identify a Hermes Agent API"
+                        "Native profile route did not identify a Hermes Agent API",
+                        error_category=ERROR_CATEGORY_MALFORMED,
                     )
             return True
         except HermesConnectionError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
             raise HermesConnectionError(
-                f"Cannot verify native Hermes profile routing at "
-                f"{self._base_url}: {err}"
+                "Cannot verify native Hermes profile routing",
+                error_category=_transport_error_category(err),
             ) from err
 
     async def async_check_connection(self) -> bool:
@@ -189,9 +233,7 @@ class HermesApiClient:
                         # authoritative for both API identity and reachability.
                         legacy_health_missing = True
                     elif resp.status != 200:
-                        raise HermesConnectionError(
-                            f"Hermes API health check returned HTTP {resp.status}"
-                        )
+                        raise self._classify_status_error(resp.status)
                     else:
                         health = await resp.json()
                         if not isinstance(health, dict) or (
@@ -199,7 +241,8 @@ class HermesApiClient:
                             or health.get("platform") != "hermes-agent"
                         ):
                             raise HermesConnectionError(
-                                "Health endpoint did not identify a Hermes Agent API"
+                                "Health endpoint did not identify a Hermes Agent API",
+                                error_category=ERROR_CATEGORY_MALFORMED,
                             )
 
             async with self._session.get(
@@ -212,15 +255,14 @@ class HermesApiClient:
                 if resp.status in (401, 403):
                     raise HermesAuthError("Invalid API key")
                 if resp.status != 200:
-                    raise HermesConnectionError(
-                        f"Hermes API authentication probe returned HTTP {resp.status}"
-                    )
+                    raise self._classify_status_error(resp.status)
                 models = await resp.json()
                 if not isinstance(models, dict) or not isinstance(
                     models.get("data"), list
                 ):
                     raise HermesConnectionError(
-                        "Models endpoint returned an invalid Hermes API response"
+                        "Models endpoint returned an invalid Hermes API response",
+                        error_category=ERROR_CATEGORY_MALFORMED,
                     )
                 if legacy_health_missing and not any(
                     isinstance(model, dict) and model.get("owned_by") == "hermes"
@@ -234,8 +276,56 @@ class HermesApiClient:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
             raise HermesConnectionError(
-                f"Cannot connect to Hermes Agent at {self._base_url}: {err}"
+                "Cannot connect to Hermes Agent",
+                error_category=_transport_error_category(err),
             ) from err
+
+    async def async_get_detailed_health(self) -> HermesDetailedHealthResult:
+        """Fetch optional authenticated /health/detailed on the selected route."""
+        await self._async_verify_native_profile_route()
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with self._session.get(
+                f"{self._base_url}{API_HEALTH_DETAILED}",
+                headers=self._headers(),
+                timeout=timeout,
+                ssl=self._ssl,
+                allow_redirects=False,
+            ) as resp:
+                if resp.status in (401, 403):
+                    return HermesDetailedHealthResult(
+                        available=False,
+                        status=None,
+                        error_category=ERROR_CATEGORY_AUTH,
+                        auth_failed=True,
+                    )
+                if (
+                    resp.status in REDIRECT_STATUS_CODES
+                    or resp.status in UNSUPPORTED_DETAILED_STATUS_CODES
+                ):
+                    return HermesDetailedHealthResult(
+                        available=False,
+                        status=None,
+                        error_category=ERROR_CATEGORY_UNSUPPORTED,
+                    )
+                if resp.status != 200:
+                    return HermesDetailedHealthResult(
+                        available=False,
+                        status=None,
+                        error_category=(
+                            ERROR_CATEGORY_SERVER
+                            if resp.status >= 500
+                            else ERROR_CATEGORY_UNREACHABLE
+                        ),
+                    )
+                payload = await resp.json()
+                return _parse_detailed_health(payload)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            return HermesDetailedHealthResult(
+                available=False,
+                status=None,
+                error_category=_transport_error_category(err),
+            )
 
     async def async_get_models(self) -> list[dict[str, Any]]:
         """Fetch available models from /v1/models."""
@@ -275,14 +365,16 @@ class HermesApiClient:
                 timeout=aiohttp.ClientTimeout(total=self._request_timeout),
                 ssl=self._ssl,
             ) as resp:
-                if resp.status == 401:
+                if resp.status in (401, 403):
                     raise HermesAuthError("Invalid API key")
                 if resp.status >= 400:
-                    body = await resp.text()
-                    raise HermesApiError(
-                        f"API error {resp.status}: {body[:500]}"
-                    )
+                    raise self._classify_status_error(resp.status)
                 data = await resp.json()
+                if _chat_completion_failed(data) or resp.headers.get("X-Hermes-Completed", "").lower() == "false":
+                    raise HermesConnectionError(
+                        "Hermes API reported an incomplete chat response",
+                        error_category=ERROR_CATEGORY_SERVER,
+                    )
                 resolved_session_id = resp.headers.get("X-Hermes-Session-Id") or session_id
                 self._last_session_id = resolved_session_id
                 return HermesApiResult(
@@ -293,7 +385,8 @@ class HermesApiClient:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise HermesConnectionError(
-                f"Connection error: {err}"
+                "Connection error",
+                error_category=_transport_error_category(err),
             ) from err
 
     async def async_stream_message(
@@ -320,58 +413,82 @@ class HermesApiClient:
                 ),
                 ssl=self._ssl,
             ) as resp:
-                if resp.status == 401:
+                if resp.status in (401, 403):
                     raise HermesAuthError("Invalid API key")
                 if resp.status >= 400:
-                    body = await resp.text()
-                    raise HermesStreamSetupError(
-                        f"API error {resp.status}: {body[:500]}"
-                    )
+                    raise self._classify_status_error(resp.status)
 
                 self._last_session_id = resp.headers.get("X-Hermes-Session-Id") or session_id
 
                 # Parse SSE stream
                 buffer = ""
                 event_name = "message"
-                async for chunk in resp.content.iter_any():
-                    buffer += chunk.decode("utf-8", errors="replace")
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.rstrip("\r")
+                terminal_failed = False
+                try:
+                    async for chunk in resp.content.iter_any():
+                        buffer += chunk.decode("utf-8", errors="replace")
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.rstrip("\r")
 
-                        if not line:
-                            event_name = "message"
-                            continue
-                        line = line.strip()
-                        if line.startswith(":"):
-                            continue
-                        if line.startswith("event:"):
-                            event_name = line[6:].strip() or "message"
-                            continue
-                        if line == "data: [DONE]":
-                            return
-                        if not line.startswith("data: "):
-                            continue
-                        if event_name != "message":
-                            continue
+                            if not line:
+                                event_name = "message"
+                                continue
+                            line = line.strip()
+                            if line.startswith(":"):
+                                continue
+                            if line.startswith("event:"):
+                                event_name = line[6:].strip() or "message"
+                                continue
+                            if line == "data: [DONE]":
+                                if terminal_failed:
+                                    raise HermesConnectionError(
+                                        "Hermes API reported an incomplete chat response",
+                                        error_category=ERROR_CATEGORY_SERVER,
+                                    )
+                                return
+                            if not line.startswith("data: "):
+                                continue
+                            if event_name == "error":
+                                terminal_failed = True
+                                continue
+                            if event_name != "message" or terminal_failed:
+                                continue
 
-                        try:
-                            data = json.loads(line[6:])
-                            delta = (
-                                data.get("choices", [{}])[0]
-                                .get("delta", {})
-                                .get("content")
-                            )
-                            if isinstance(delta, str) and delta:
-                                yield delta
-                        except (json.JSONDecodeError, IndexError):
-                            continue
+                            try:
+                                data = json.loads(line[6:])
+                                if _chat_completion_failed(data):
+                                    terminal_failed = True
+                                    continue
+                                delta = (
+                                    data.get("choices", [{}])[0]
+                                    .get("delta", {})
+                                    .get("content")
+                                )
+                                if isinstance(delta, str) and delta:
+                                    yield delta
+                            except (json.JSONDecodeError, IndexError):
+                                continue
+                except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                    if terminal_failed:
+                        raise HermesConnectionError(
+                            "Hermes API reported an incomplete chat response",
+                            error_category=ERROR_CATEGORY_SERVER,
+                        ) from err
+                    raise
+                if terminal_failed:
+                    raise HermesConnectionError(
+                        "Hermes API reported an incomplete chat response",
+                        error_category=ERROR_CATEGORY_SERVER,
+                    )
+                raise HermesConnectionError("Stream ended without a completion marker")
 
         except HermesApiError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise HermesConnectionError(
-                f"Stream connection error: {err}"
+                "Stream connection error",
+                error_category=_transport_error_category(err),
             ) from err
 
     @staticmethod
@@ -381,3 +498,57 @@ class HermesApiClient:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError):
             return data.get("error", {}).get("message", "(No response)")
+
+
+def _chat_completion_failed(data: Any) -> bool:
+    """Interpret Hermes terminal metadata without exposing its raw error details."""
+    if not isinstance(data, dict):
+        return False
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        if choices[0].get("finish_reason") in ("error", "length"):
+            return True
+    hermes = data.get("hermes")
+    if isinstance(hermes, dict) and (
+        hermes.get("completed") is False
+        or hermes.get("partial") is True
+        or hermes.get("failed") is True
+    ):
+        return True
+    return "error" in data and data["error"] is not None
+
+
+def _transport_error_category(err: BaseException) -> str:
+    if isinstance(err, asyncio.TimeoutError):
+        return ERROR_CATEGORY_TIMEOUT
+    if isinstance(err, ValueError):
+        return ERROR_CATEGORY_MALFORMED
+    return ERROR_CATEGORY_UNREACHABLE
+
+
+def _parse_detailed_health(payload: Any) -> HermesDetailedHealthResult:
+    if not isinstance(payload, dict):
+        return HermesDetailedHealthResult(
+            available=False,
+            status=None,
+            error_category=ERROR_CATEGORY_MALFORMED,
+        )
+    status = payload.get("status")
+    if not isinstance(status, str) or status not in HEALTH_STATUSES:
+        return HermesDetailedHealthResult(
+            available=False,
+            status=None,
+            error_category=ERROR_CATEGORY_MALFORMED,
+        )
+    platform = payload.get("platform")
+    if platform is not None and platform != "hermes-agent":
+        return HermesDetailedHealthResult(
+            available=False,
+            status=None,
+            error_category=ERROR_CATEGORY_MALFORMED,
+        )
+    return HermesDetailedHealthResult(
+        available=True,
+        status=status,
+        error_category=None,
+    )

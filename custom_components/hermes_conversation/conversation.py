@@ -28,8 +28,10 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import intent, template
 
-from .api import HermesApiClient, HermesApiError, HermesStreamSetupError
+from .activity import ACTIVITY_ERROR_CATEGORIES, ConversationActivityTracker
+from .api import HermesApiClient, HermesApiError, HermesAuthError, HermesStreamSetupError
 from .compat import entry_value, resolve_continued_conversation_mode
+from .entity import hermes_device_info
 from .const import (
     CONF_ALWAYS_SPEAK_FALLBACK,
     CONF_API_KEY,
@@ -58,6 +60,7 @@ from .const import (
     FOLLOW_UP_MODE_AUTO,
     LEGACY_CONF_INSTRUCTIONS,
 )
+from .speech import SpeechEmojiFilter, SpeechMarkdownFilter, strip_speech_emoji
 
 try:
     from homeassistant.components.conversation import ChatLog, async_get_chat_log
@@ -71,10 +74,16 @@ _LOGGER = logging.getLogger(__name__)
 _MAX_CACHED_CONVERSATIONS = 50
 _QUESTION_MARKERS = ("?", "\uFF1F")
 _TRAILING_CLOSERS = "\"')]}" + "\u201d\u2019\u00bb"
+_VOICE_SPEECH_PROMPT = (
+    "Your responses are spoken aloud. Use plain, speakable text. "
+    "Do not use emoji, markdown, or decorative formatting. "
+    "Preserve meaningful units, percentages, currencies, and mathematical expressions."
+)
 _AUTO_FOLLOW_UP_PROMPT = (
     "When voice auto follow-up is active and you want the user to reply, "
     "give any needed answer first and end with one short, direct question as "
-    "the final sentence. Do not add any words after the question mark."
+    "the final sentence. End with the question mark, with nothing after the question mark "
+    "(no words, emoji, or decorations)."
 )
 
 _UNSAFE_SPEECH_TAG_PATTERN = (
@@ -125,6 +134,8 @@ class _UnsafeSpeechStreamFilter:
     def __init__(self) -> None:
         self._buffer = ""
         self._discard_until_tag: str | None = None
+        self._emoji_filter = SpeechEmojiFilter()
+        self._markdown_filter = SpeechMarkdownFilter()
 
     def feed(self, text: str) -> str:
         """Add a stream delta and return the safe text that can be emitted now."""
@@ -133,8 +144,13 @@ class _UnsafeSpeechStreamFilter:
         self._buffer += text
         return self._drain(final=False)
 
-    def flush(self) -> str:
-        """Return any remaining safe text at end of stream."""
+    def flush(self, *, partial: bool = False) -> str:
+        """Return the safe suffix, without releasing incomplete tags on errors."""
+        if partial:
+            self._buffer = ""
+            self._discard_until_tag = None
+            safe = self._emoji_filter.feed(self._markdown_filter.flush())
+            return safe + self._emoji_filter.flush()
         return self._drain(final=True)
 
     def _drain(self, *, final: bool) -> str:
@@ -184,7 +200,14 @@ class _UnsafeSpeechStreamFilter:
             safe_parts.append(self._consume_safe_buffer(final=final))
             break
 
-        return _sanitize_stream_text_for_speech("".join(safe_parts))
+        visible = self._markdown_filter.feed("".join(safe_parts))
+        if final:
+            visible += self._markdown_filter.flush()
+        cleaned = _sanitize_stream_text_for_speech(visible)
+        safe = self._emoji_filter.feed(cleaned)
+        if final:
+            safe += self._emoji_filter.flush()
+        return safe
 
     def _consume_safe_buffer(self, *, final: bool) -> str:
         if final:
@@ -220,8 +243,8 @@ def _sanitize_stream_text_for_speech(text: str) -> str:
         return text
     cleaned = text.replace("\r\n", "\n")
     cleaned = _remove_unsafe_speech_markup(cleaned)
-    cleaned = re.sub(r"!\[([^\]]*)\]\([^\)]+\)", r"\1", cleaned)
-    cleaned = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", cleaned)
+    markdown_filter = SpeechMarkdownFilter()
+    cleaned = markdown_filter.feed(cleaned) + markdown_filter.flush()
     return (
         cleaned.replace("```", "")
         .replace("`", "")
@@ -238,10 +261,11 @@ def _sanitize_text_for_speech(text: str) -> str:
 
     cleaned = text.replace("\r\n", "\n")
     cleaned = _remove_unsafe_speech_markup(cleaned)
+    cleaned = strip_speech_emoji(cleaned)
     cleaned = re.sub(r"```(?:[\w+-]+)?\n?(.*?)```", r"\1", cleaned, flags=re.DOTALL)
     cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
-    cleaned = re.sub(r"!\[([^\]]*)\]\([^\)]+\)", r"\1", cleaned)
-    cleaned = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", cleaned)
+    markdown_filter = SpeechMarkdownFilter()
+    cleaned = markdown_filter.feed(cleaned) + markdown_filter.flush()
     cleaned = re.sub(r"^#{1,6}\s*", "", cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r"^>+\s*", "", cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r"^\s*[-*+]\s+", "", cleaned, flags=re.MULTILINE)
@@ -255,6 +279,18 @@ def _sanitize_text_for_speech(text: str) -> str:
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
     return cleaned.strip()
+
+
+def _activity_error_category(err: HermesApiError) -> str:
+    """Reduce API errors to a fixed safe vocabulary, not raw messages."""
+    if isinstance(err, HermesAuthError):
+        return "auth"
+    category = getattr(err, "error_category", None)
+    return (
+        category
+        if isinstance(category, str) and category in ACTIVITY_ERROR_CATEGORIES
+        else "unreachable"
+    )
 
 
 class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
@@ -275,8 +311,14 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         self.entry = entry
         self.client = client
         self.session_map = session_map
+        self.conversation_activity: ConversationActivityTracker | None = (
+            hass.data.get(DOMAIN, {})
+            .get(entry.entry_id, {})
+            .get("conversation_activity")
+        )
         self._attr_unique_id = entry.entry_id
         self._attr_name = getattr(entry, "title", None) or "Hermes Agent"
+        self._attr_device_info = hermes_device_info(entry)
         self._attr_supported_features = ConversationEntityFeature.CONTROL
         # conversation_id -> list of {"role": ..., "content": ...}
         self._history: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
@@ -323,6 +365,11 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         chat_log: ChatLog | None = None,
     ) -> ConversationResult:
         """Process a conversation turn and convert unexpected errors."""
+        request_token = (
+            self.conversation_activity.start() if self.conversation_activity else None
+        )
+        request_outcome = "failed"
+        request_state: dict[str, Any] = {"partial": False, "error_category": None}
         try:
             if (
                 chat_log is None
@@ -340,10 +387,16 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                         user_input,
                     ) as active_chat_log,
                 ):
-                    return await self._async_process_inner(
-                        user_input, chat_log=active_chat_log
+                    result, failed = await self._async_process_inner(
+                        user_input, chat_log=active_chat_log, request_state=request_state
                     )
-            return await self._async_process_inner(user_input, chat_log=chat_log)
+            else:
+                result, failed = await self._async_process_inner(
+                    user_input, chat_log=chat_log, request_state=request_state
+                )
+            if not failed:
+                request_outcome = "partial" if request_state["partial"] else "completed"
+            return result
         except Exception:
             _LOGGER.exception("Unexpected error in async_process")
             intent_response = intent.IntentResponse(language=user_input.language)
@@ -358,10 +411,23 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 or "default",
                 continue_conversation=False,
             )
+        except BaseException:
+            request_outcome = "cancelled"
+            raise
+        finally:
+            if self.conversation_activity:
+                self.conversation_activity.finish(
+                    request_token,
+                    request_outcome,
+                    error_category=request_state["error_category"],
+                )
 
     async def _async_process_inner(
-        self, user_input: ConversationInput, chat_log: ChatLog | None = None
-    ) -> ConversationResult:
+        self,
+        user_input: ConversationInput,
+        chat_log: ChatLog | None = None,
+        request_state: dict[str, Any] | None = None,
+    ) -> tuple[ConversationResult, bool]:
         """Inner processing — wrapped by async_process for error logging."""
         conv_id = (
             getattr(chat_log, "conversation_id", None)
@@ -391,6 +457,11 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 origin_block = "Origin context:\n" + "\n".join(f"- {line}" for line in context_lines)
                 system_prompt = (system_prompt + "\n\n" + origin_block) if system_prompt else origin_block
 
+        # Every response enters HA speech, even without device-origin metadata.
+        system_prompt = (
+            f"{system_prompt}\n\n{_VOICE_SPEECH_PROMPT}"
+            if system_prompt else _VOICE_SPEECH_PROMPT
+        )
         system_prompt = self._append_auto_follow_up_prompt(
             system_prompt,
             follow_up_mode,
@@ -417,9 +488,12 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                     chat_log,
                     messages,
                     session_id=session_id,
+                    request_state=request_state,
                 )
             spoken_text = _sanitize_text_for_speech(response_text)
         except HermesApiError as err:
+            if request_state is not None:
+                request_state["error_category"] = _activity_error_category(err)
             _LOGGER.error("Hermes API error: %s", err)
             intent_response = intent.IntentResponse(language=user_input.language)
             intent_response.async_set_error(
@@ -430,7 +504,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 intent_response,
                 conv_id,
                 continue_conversation=False,
-            )
+            ), True
 
         if session_key:
             self._remember_session(session_key, self.client.last_session_id)
@@ -462,13 +536,14 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             intent_response,
             conv_id,
             continue_conversation=continue_conversation,
-        )
+        ), False
 
     async def _stream_chat_log_response(
         self,
         chat_log: ChatLog,
         messages: list[dict[str, str]],
         session_id: str | None = None,
+        request_state: dict[str, Any] | None = None,
     ) -> str:
         """Stream safe assistant deltas into Home Assistant's chat log."""
         chunks: list[str] = []
@@ -488,6 +563,9 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                     yield {"content": chunk}
             except HermesApiError as err:
                 if chunks:
+                    if request_state is not None:
+                        request_state["partial"] = True
+                        request_state["error_category"] = _activity_error_category(err)
                     _LOGGER.warning(
                         "Hermes stream failed after content started; keeping partial response: %s",
                         err,
@@ -502,6 +580,9 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 pass
         except HermesApiError as err:
             if chunks:
+                if request_state is not None:
+                    request_state["partial"] = True
+                    request_state["error_category"] = _activity_error_category(err)
                 _LOGGER.warning(
                     "Hermes stream failed after content started; keeping partial response: %s",
                     err,
@@ -527,8 +608,12 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 stream_started = True
                 if safe_chunk := speech_filter.feed(chunk):
                     yield safe_chunk
-        except HermesStreamSetupError as err:
-            if stream_started:
+        except HermesApiError as err:
+            if stream_started or not isinstance(err, HermesStreamSetupError):
+                # Preserve a pending plain digit/symbol in a partial response,
+                # but never flush unfinished reasoning/tool markup on failure.
+                if safe_tail := speech_filter.flush(partial=True):
+                    yield safe_tail
                 raise
             _LOGGER.debug(
                 "Hermes streaming setup failed; falling back to non-streaming: %s",
@@ -556,13 +641,6 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         try:
             async for chunk in self._iter_voice_safe_response(messages, session_id):
                 chunks.append(chunk)
-        except HermesStreamSetupError as err:
-            _LOGGER.debug(
-                "Hermes streaming setup failed; falling back to non-streaming: %s",
-                err,
-            )
-            result = await self.client.async_send_message(messages, session_id=session_id)
-            return result.text
         except HermesApiError:
             if chunks:
                 _LOGGER.warning(

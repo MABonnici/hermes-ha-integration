@@ -17,6 +17,8 @@ A [Home Assistant](https://home-assistant.io/) custom integration that connects 
 - **Username resolution** — passes the user's name to the agent
 - **Configurable** — connection settings and prompt options can be changed anytime via Configure
 - **Multiple instances and profiles** — connect Assist agents to the root API, Home Assistant add-on profile routes, or native Hermes multiplexer routes
+- **Diagnostic entities** — one device per config entry exposes authenticated API connectivity, optional health, API latency, and last successful connection
+- **Conversation activity**: push-only counts, durations, results, and lifecycle events for conversation requests originating through this Home Assistant entry (including `conversation.process`), not global Hermes activity
 
 ## Requirements
 
@@ -75,7 +77,7 @@ After setup, all settings can be changed via **Settings → Devices & Services �
 | API Key                                  | (empty)             | Add-on Access Password, or the selected native profile's own API key                   |
 | Use HTTPS                                | Yes                 | Connect via HTTPS                                                                      |
 | Verify SSL certificate                   | No                  | Verify the SSL certificate (disable for self-signed)                                   |
-| System Prompt                            | (built-in)          | Jinja2 template — leave empty to use Hermes Agent's own prompt                         |
+| System Prompt                            | (built-in)          | Jinja2 template; empty omits custom context, but speech-format guidance still applies                         |
 | Include exposed entities                 | No                  | Include smart home device states in the system prompt                                  |
 | Max context characters                   | 12000               | Character limit for the entity context block                                           |
 | Follow-up listening                      | Off                 | Off, always on, or automatic only when Hermes asks a follow-up question                 |
@@ -111,11 +113,143 @@ This separates Home Assistant's continued-conversation UX from Hermes's backend 
 Use **Follow-up listening: Auto when Hermes asks a question** if you want Assist
 to reopen only when Hermes ends with a direct question.
 
+Replies are requested as plain, speakable text in every mode, including with an
+empty custom system prompt. Emoji are removed before streamed or final speech
+reaches TTS and before Auto follow-up is evaluated. Meaningful units, percentages,
+currencies, and mathematical symbols are preserved; dual-use symbols such as
+arrows are removed only when explicitly presented as emoji.
+
+Auto asks Hermes to put one direct question last, with nothing after the question
+mark. It still checks the final sentence, not earlier quoted questions or
+language-specific phrases such as "Tell me what time."
+
+## Diagnostic entities
+
+Each config entry creates one Home Assistant device that groups the conversation agent with four diagnostic entities. A shared coordinator polls the selected profile once every 60 seconds. Conversation setup is not blocked when the API is down; connectivity turns off and recovers on later polls.
+
+| Entity | What it means |
+| ------ | ------------- |
+| `binary_sensor.hermes_agent_api_connectivity` | Authenticated reachability of the selected route. On means the existing connection probe succeeded (`/v1/health` identity plus authenticated `/v1/models`). Off means the API is currently unreachable or unauthorized. This is **not** provider/model readiness. |
+| `sensor.hermes_agent_health` | Optional authenticated `/health/detailed` status: `ok` or `degraded`. HTTP 200 can still be `degraded`. Unavailable when the endpoint is absent, uses an unsupported method, redirects, returns malformed JSON/status, or otherwise cannot be interpreted. Public `/health` success is not authentication. |
+| `sensor.hermes_agent_api_latency` | Duration of the authenticated connection probe in milliseconds. This is not model or chat latency. Unavailable while connectivity is off. |
+| `sensor.hermes_agent_last_successful_connection` | UTC timestamp of the initial successful authenticated connection or the first success after an offline period. Healthy polls keep the same timestamp while connectivity, health, and latency continue to update. The previous value is preserved while the API is offline. Unavailable until the first success. |
+
+Entity IDs follow the config-entry title. The examples above use the default title `Hermes Agent`. A second entry titled `Worker` would use names such as `binary_sensor.worker_api_connectivity`.
+
+### Semantics and fallbacks
+
+- Connectivity is authenticated. A public health `200` is not enough; `/v1/models` `401`/`403` is offline.
+- Optional health is requested on the **same** selected `base_url` (`/`, `/profile/<name>`, or `/p/<name>`). The integration never falls back from a named profile to the root and never sends credentials before native route canary checks.
+- Legacy Hermes builds that return `404` for `/v1/health` still authenticate through `/v1/models` when the models list identifies Hermes.
+- `/health/detailed` `404`/`405`/`501`, malformed responses and server errors leave health unavailable while basic connectivity can stay on. A `401`/`403` makes connectivity off too.
+- Polling uses only health and model-list endpoints; it never runs the model or spends tokens. Health reports Hermes's internal readiness, not a live provider test. See the [Hermes API documentation](https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server#get-healthdetailed).
+- Gateway-wide uptime and workload counters are not exposed: these require reliable server telemetry with an unambiguous scope. Last successful connection is not the agent's start time and resets when the entry reloads.
+- Missing optional health is not idle. Use connectivity `off` for outage automations.
+- Attributes only expose sanitized error categories (`auth`, `timeout`, `redirect`, `unsupported`, `malformed`, `server`, `unreachable`). Raw response bodies, credentials, and detailed health payloads are never copied into entity state.
+
+### Example: notify when connectivity stays off
+
+```yaml
+automation:
+  - alias: Hermes API connectivity lost
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.hermes_agent_api_connectivity
+        to: "off"
+        for: "00:02:00"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: Hermes Agent
+          message: Authenticated API connectivity has been off for 2 minutes.
+```
+
+## Conversation activity
+
+The same per-entry device also exposes four push-only entities for conversation requests
+**originating in Home Assistant through this integration entry**, including Assist and
+`conversation.process`. They are not gateway-wide or profile-wide activity and do not
+observe Telegram, other clients, or work continuing on Hermes after HA disconnects.
+Changes appear immediately on request start and finish; they do not wait for the
+60-second diagnostics poll and make no additional API or model requests. The count is
+local and resets to zero on entry reload. Last-result sensors start unavailable again
+after a reload, rather than claiming a previous result or idle work elsewhere.
+
+The device name already supplies the `Hermes Agent` prefix for the default entry title.
+Fresh entity IDs below use that title; existing published diagnostic IDs remain unchanged.
+A differently titled entry uses its own title as the prefix.
+
+| Entity | Meaning |
+| ------ | ------- |
+| `binary_sensor.hermes_agent_processing_conversation` | On while at least one conversation request through this entry is active. |
+| `sensor.hermes_agent_active_conversation_requests` | Concurrent requests through this entry, including overlaps; zero says nothing about activity elsewhere. |
+| `sensor.hermes_agent_last_conversation_duration` | Elapsed seconds of the most recently finished request, measured with a monotonic clock. Unavailable until a request finishes. |
+| `sensor.hermes_agent_last_conversation_result` | Most recently finished request: `completed`, `partial`, `failed`, or `cancelled`. Unavailable until a request finishes. |
+
+`partial` means the modern ChatLog path delivered some content but the stream then
+failed, so the partial reply was kept without retrying model or tool work. On legacy
+HA without ChatLog, a stream failure produces a `failed` result. Non-streaming
+fallback is reserved for an explicit, known pre-dispatch streaming rejection from an
+adapter; if it succeeds, the local request is `completed`. HTTP failures after a
+streaming POST (including 4xx, 429, and 5xx), timeouts, and connection drops are
+ambiguous: even before the first response delta, Hermes may already have run tools.
+They fail locally without a second POST. A failure after delivered content is
+`partial` on modern HA, with no retry. A Hermes SSE terminal with
+`finish_reason: error`, `finish_reason: length`, or explicit incomplete/failed
+`hermes` metadata is not a success even if followed by `[DONE]`. A non-streaming
+HTTP 200 with the same metadata (or `X-Hermes-Completed: false`) is likewise not
+reported as successful. Server-provided error details are not copied into the
+reply, logs, or activity event: terminal failures use the safe `server` category.
+With no delivered content the local outcome is `failed`; with already-delivered
+content, modern ChatLog retains a `partial` reply and legacy HA reports `failed`.
+`cancelled` means HA stopped waiting for the local request or the entry unloaded;
+it does **not** stop backend work remotely. A local `completed` outcome does not
+prove that a requested tool action took effect or that audio playback completed.
+
+The `hermes_conversation_activity` event fires at start and terminal transition:
+
+| Field | Values |
+| ----- | ------ |
+| `entry_id` | Config entry ID (use to distinguish entries). |
+| `request_id` | Locally generated UUID, identical for start and finish; not a conversation or Hermes session ID. |
+| `source` | Always `home_assistant`. |
+| `status` | `started`, `completed`, `partial`, `failed`, or `cancelled`. |
+| `active_requests` | Concurrent local count after this transition. |
+| `duration_seconds` | Nonnegative elapsed seconds on terminal events only. |
+| `error_category` | Optional terminal category from a fixed vocabulary: `auth`, `timeout`, `redirect`, `unsupported`, `malformed`, `server`, `unreachable`. |
+
+Events and entities never contain prompts, responses, user or device names, backend
+session IDs, credentials or raw errors. To notify when a local request finishes
+unsuccessfully, filter the terminal event and use only its safe metadata:
+
+```yaml
+automation:
+  - alias: Hermes conversation request did not complete
+    trigger:
+      - platform: event
+        event_type: hermes_conversation_activity
+    condition:
+      - condition: template
+        value_template: "{{ trigger.event.data.status in ['partial', 'failed'] }}"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: Hermes conversation request
+          message: "Local request ended {{ trigger.event.data.status }}."
+```
+
 ## How It Works
 
 This integration communicates with Hermes Agent's OpenAI-compatible API (`/v1/chat/completions`) using only Home Assistant's built-in HTTP client — **no external Python dependencies**.
 
 Hermes Agent handles tool execution (controlling lights, checking sensors, etc.) server-side through its own Home Assistant tools. This means the conversation integration stays simple: it sends your message, gets back the response (which may include results from tool actions the agent performed), and displays it.
+
+## Development tests
+
+Run the dependency-free unit suite with `python -m unittest discover -s tests -v`.
+Those tests use Home Assistant stubs. The separate [runtime test suite](runtime_tests/README.md)
+uses real Home Assistant registries, states and lifecycle with a loopback Hermes API.
+Run the two suites in separate processes to keep the stubs isolated.
 
 ## License
 
